@@ -1,0 +1,1073 @@
+---
+title: "Dashboard"
+output:
+  flexdashboard::flex_dashboard:
+    css: styles-auth.css
+    orientation: columns
+    vertical_layout: fill
+    logo: "imag/Logotipo_DIIC-i.png"
+    social: menu
+    #source_code: embed
+    theme: united
+    includes:
+      in_header: cssloaders_in_header.html
+    #theme: default, cerulean, journal, flatly, darkly, readable, spacelab, united, cosmo, lumen, paper, sandstone, simplex, yeti
+    #  highlight: default, tango, pygments, kate, monochrome, espresso, zenburn, haddock, breezedark, textmate
+runtime: shiny 
+---
+
+```{r}
+start_time <- proc.time()
+```
+
+```{r librerias, include=FALSE}
+library(magrittr) # %>%, %<>%
+library(elasticsearchr) # %search%, devtools::install_github("alexioannides/elasticsearchr"
+# library(DT)
+#library(shinyjs)
+#library(shinyWidgets)
+# library(shinymanager)  # this is for pass control
+# library(downloadthis)
+# library(git2r) # this is for git connection
+```
+
+```{r credentials, include=FALSE}
+# define las credenciales de acceso.. (you can also use sqlite database)
+credentials <- data.frame(
+  user = c("shiny", "shinymanager"),
+  password = c("mmm333", "12345"),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r auth, eval=T}
+# parte esencial para el control de accesos
+shinymanager::auth_ui(id = "auth")
+
+auth <- shiny::callModule(
+    module = shinymanager::auth_server,
+    id = "auth",
+    check_credentials = shinymanager::check_credentials(credentials) # data.frame
+    # check_credentials = shinymanager::check_credentials("path/to/credentials.sqlite", passphrase = "supersecret") # sqlite
+)
+```
+
+
+
+```{r datos}
+datos <- elasticsearchr::elastic("http://localhost:9200", "dashboard_keyword")
+datos_na <- elasticsearchr::elastic("http://localhost:9200", "dashboard_keyword")
+```
+
+```{r obtener_tipo}
+x <- elastic::connect()
+obtener_tipo <- function(campo) {
+  caps <- elastic::field_caps(x, campo, "dashboard_keyword")
+  names(caps$fields[[1]])
+}
+```
+
+
+
+```{r selecciona}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-fields.html
+# https://www.elastic.co/guide/en/elasticsearch/reference/6.8/search-request-source-filtering.html
+# selecciona los campos indicados
+selecciona <- function(campos) {
+  json <- paste0('{"includes":["',paste0(campos, collapse = '","'),'"]}')
+  elasticsearchr::select_fields(json)
+}
+```
+
+
+
+```{r regla_rango}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-range-query.html
+# devuelve las observaciones cuyo campo esta entre liminf y limsup incluidos
+regla_rango <- function(campo, liminf, limsup) {
+  paste0('{"range":{"',campo,'":{"gte":"',liminf,'","lte":"',limsup,'"}}}')
+}
+```
+```{r regla_term}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-term-query.html
+# Returns documents that contain an exact term in a provided field.
+regla_term <- function(campo, term) {
+  paste0('{"term":{"',campo,'":"',term,'"}}')
+}
+```
+```{r regla_regexp}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-regexp-query.html
+# Returns documents that contain terms matching a regular expression.
+regla_regexp <- function(campo, expreg) {
+  paste0('{"regexp":{"',campo,'":"',expreg,'"}}')
+}
+```
+
+```{r filtro_simple}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/getting-started-search.html
+# filtro con una sola clausula booleana (regla)
+filtro_simple <- function(regla) {
+  elasticsearchr::query(regla)
+}
+```
+```{r filtro_comp}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-bool-query.html
+# filtro resultado de la conjuncion (Y) de varias clausulas
+# reglas_si son clausulas que deben cumplir las observaciones
+# reglas_no son clausulas que no deben cumplir las observaciones
+# al menos uno de reglas_si o reglas_no no puede ser nulo
+filtro_comp <- function(reglas_si = NULL, reglas_no = NULL) {
+  reglas <- c()
+  if (!is.null(reglas_si)) {
+    json <- paste0('"filter":[',paste0(reglas_si, collapse = ','),']')
+    reglas %<>% append(json)
+  }
+  if (!is.null(reglas_no)) {
+    json <- paste0('"must_not":[',paste0(reglas_no, collapse = ','),']')
+    reglas %<>% append(json)
+  }
+  json <- paste0('{"bool":{',paste0(reglas, collapse = ','),'}}')
+  elasticsearchr::query(json)
+}
+```
+
+
+
+```{r ordena}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/sort-search-results.html
+# cada campo se puede ordenar por orden "asc" o "desc"
+# si solo se especifica un orden se usara el mismo para todos los campos
+ordena <- function(campos, ordenes) {
+  criterios <- paste0('{"',campos,'":"',ordenes,'"}')
+  json <- paste0('[',paste0(criterios, collapse = ','),']')
+  elasticsearchr::sort_on(json)
+}
+```
+
+
+
+```{r agrega}
+# fun puede ser "sum", "min", "max", "avg", ...
+# orden puede ser nulo o "asc" o "desc"
+agrega <- function(campo, fun, orden = NULL) {
+  tipo <- obtener_tipo(campo)
+  if (tipo == "date") {
+    f <- ',"format":"yyyy-MM-dd"'
+  } else { # tipo == "text"
+    f <- ''
+  }
+  json <-paste0('"',fun,'_',campo,'":{"',fun,'":{"field":"',campo,'"',f,'}}')
+  agregaciones <- c(json)
+  if (!is.null(orden)) {
+    orden <- ordena(paste0(fun,'_',campo), orden)
+    json <- paste0('"',campo,'_sort":{"bucket_sort":{',orden$api_call,'}}')
+    agregaciones %<>% append(json)
+  }
+  json <- paste0('{',paste0(agregaciones, collapse = ','),'}')
+  elasticsearchr::aggs(json)
+}
+```
+```{r sum_palets}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-metrics-sum-aggregation.html
+sum_palets <- agrega("palets", "sum", NULL)
+```
+```{r max_fechaentrega}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-metrics-max-aggregation.html
+max_fechaentrega <- agrega("fechaentregadesde", "max", NULL)
+```
+
+```{r agrupa_clave}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-bucket-terms-aggregation.html
+# group_by para campo con tipo text
+# por defecto, ordena "desc" segun el recuento
+# si ordenado es T ordena "asc" segun los distintos valores del campo
+agrupa_clave <- function(campo, ordenado = F) {
+  if (ordenado) {
+    order <- ',"order":{"_key":"asc"}'
+  } else {
+    order <- ''
+  }
+  paste0('"terms":{"field":"',campo,'.keyword","size":10000',order,'}')
+}
+```
+```{r agrupa_fecha}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-aggregations-bucket-datehistogram-aggregation.html
+# group_by para campo con tipo date
+# por defecto, agrupa por dias ordena "asc" segun la fecha
+agrupa_fecha <- function(campo) {
+  paste0('"date_histogram":{"field":"',campo,'",
+                            "calendar_interval":"day",
+                            "format":"yyyy-MM-dd"}')
+}
+```
+```{r agrupa}
+# group_by
+# tenemos que distinguir segun el tipo del campo
+# permite anidar otro group_by/agregacion mediante subagg
+# ordenado solo tiene sentido si el tipo del campo es "text"
+agrupa <- function(campo, ordenado = F, subagg = NULL) {
+  tipo <- obtener_tipo(campo)
+  if (tipo == "date") {
+    actagg <- agrupa_fecha(campo)
+  } else { # tipo == "text"
+    actagg <- agrupa_clave(campo, ordenado)
+  }
+  agregaciones <- c(actagg)
+  if (!is.null(subagg))
+    agregaciones %<>% append(subagg$api_call)
+  json<-paste0('{"group_by_',campo,'":{',paste0(agregaciones,collapse=','),'}}')
+  elasticsearchr::aggs(json)
+}
+```
+
+```{r agrupa_agrega}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/getting-started-aggregations.html
+# cada campo se puede ordenar por orden "asc" segun sus valores
+# o dejar el orden por defecto "desc" segun el recuento
+# si solo se especifica un orden se usara el mismo para todos los campos
+agrupa_agrega <- function(campos, ordenados = F, agregacion = NULL) {
+  df <- data.frame(campos, ordenados)
+  res <- agregacion
+  if (nrow(df) > 1) {
+    for (i in nrow(df):2)
+      res <- agrupa(df$campos[i], df$ordenados[i], res)
+  }
+  agrupa(df$campos[1], df$ordenados[1], res)
+}
+```
+```{r cuenta}
+cuenta <- function(campos, ordenados = F) {
+  agrupa_agrega(campos, ordenados, NULL)
+}
+```
+
+
+
+
+```{r}
+end_time <- proc.time()
+tiempos <<- paste0("init: ",
+                   paste0(format((end_time-start_time)[1:3], digits = 3),
+                          collapse = " - "),
+                   "\n")
+```
+
+
+
+# entradas {.sidebar }
+
+```{r fechas}
+# shiny::selectInput('valor', 'Selecciona un valor', unique(datosvalores$df.control$ticker))
+
+shiny::dateRangeInput(inputId = "Date",
+                      label = "Selet Date Range",
+                      start = "2018-01-02",
+                      end   = "2018-01-03",
+                      min   = "2018-01-02",
+                      max   = "2018-12-31" )
+```
+
+```{r actualizarFechas}
+actualizarFechas <- shiny::reactive({
+  F1 <- input$Date[1]
+  F2 <- input$Date[2]
+  tiempos <<- paste0(tiempos, "\nFechas: ", F1, " - ", F2, "\n")
+})
+```
+
+```{r filtra_fechapedido}
+regla_fechapedido <- shiny::reactive({
+  F1 = input$Date[1]
+  F2 = input$Date[2]
+  regla_rango("fechapedido", F1, F2)
+})
+
+filtra_fechapedido <- shiny::reactive({
+  filtro_simple({regla_fechapedido()})
+})
+```
+```{r filtra_fechacarga}
+regla_fechacarga <- shiny::reactive({
+  F1 = input$Date[1]
+  F2 = input$Date[2]
+  regla_rango("fechacargadesde", F1, F2)
+})
+
+filtra_fechacarga <- shiny::reactive({
+  filtro_simple({regla_fechacarga()})
+})
+```
+
+```{r downloadButtonRmd}
+# Auro 07/05/2020 (start)
+downloadButtonRmd <- function(outputId, label = "Download", class = NULL, ...) {
+  htmltools::a(id = outputId,
+               class = paste("btn btn-default shiny-download-link", class),
+               href = "", target = "_blank", download = NA, 
+               shiny::icon("download"), label, ...)
+}
+# Auro 07/05/2020 (end)
+```
+
+```{r descargas}
+# Jose 08/05/2020 (start)
+htmltools::h5("Download log file:")
+downloadButtonRmd(#label = "Download log file",
+                  outputId = "downLog")
+# Jose 08/05/2020 (end)
+
+htmltools::h5("Download seasonality file:")
+downloadButtonRmd(#label = "Download seasonality file",
+                  outputId = "downExp")
+
+htmltools::h5("Download execution times:")
+downloadButtonRmd(#label = "Download execution times",
+                  outputId = "downTimes")
+
+ 
+htmltools::h5("GitHub seasonality file:")
+shiny::actionButton("do", "Click Me")
+
+shiny::observeEvent(input$do, {
+# shiny::reactive(input$do, {
+  
+  path <- "../hola"
+  github_url <- "https://github.com/auroragonzalez/hola"
+  
+  
+  #### opcion 1: usar usuario/contraseña github
+  ### opcion 1.1: introducir la password en el codigo :(
+  # github_credentials <- git2r::cred_user_pass("auroragonzalez", "mypassword")
+  
+  ### opcion 1.2: instalar el paquete getPass, te saldrá un prompt preguntando la password
+  # github_credentials <- git2r::cred_user_pass("auroragonzalez")
+  
+  ### opcion 1.3: usar variables de entorno, puedes declararlas desde R (fuera del codigo):
+  ## Sys.setenv(GITHUB_USE = "auroragonzalez")
+  ## Sys.setenv(GITHUB_PAS = "mypassword")
+  # github_credentials <- git2r::cred_env("GITHUB_USE", "GITHUB_PAS")
+  
+  
+  #### opcion 2: usar clave ssh (creo que hay que asociarla a la cuenta github, pero no sé cómo)
+  ### opcion 2.1: introducir la passphrase en el codigo :(
+  # github_credentials <- git2r::cred_ssh_key(passphrase = "mypassphrase")
+  ### opcion 2.2: instalar el paquete getPass, te saldrá un prompt preguntando la passphrase
+  # github_credentials <- git2r::cred_ssh_key()
+  
+  
+  #### opcion 3: usar token (hay que generarlo desde github) y
+  #### variable de entorno que puede declararse desde R (fuera del codigo):
+  ## Sys.setenv(GITHUB_PAT = "pega_aqui_el_token")
+  github_credentials <- git2r::cred_token("GITHUB_PAT")
+  
+  if (!dir.exists(path)) {
+    # hace una copia local del repositorio remoto y
+    # añade un directorio .git a la carpeta creada
+    repo <- git2r::clone(github_url, path)
+######################
+    git2r::config(repo, user.name = "auroragonzalez",
+                  user.email = "tucorreo")
+######################
+  } else {
+    # si ya existe, esta es la manera de recuperar el objeto repo,
+    # gracias al directorio .git
+    repo <- git2r::repository(path)
+    # actualizamos el repositorio local
+    git2r::pull(repo, credentials = github_credentials)
+  }
+  
+  data2 <- {exportacionesEstac()}
+############### SI QUIERES QUE SE REFLEJE AQUI TAMBIEN LA SELECCION
+  if (!("All" %in% input$selectProd))
+    data2 %<>% dplyr::filter(Product %in% input$selectProd)
+###############
+############### SI QUIERES ESCRIBIR LA TABLA EN FORMATO ANCHO (1 FILA/PRODUCTO Y 1 COLUMNA/FECHA) REFLEJANDOSE LA SELECCION
+  data2 <- {descargaExp()}
+###############
+  write.table(data2, paste0(path,'/seasonality.csv'))
+  git2r::add(repo, "seasonality.csv")
+  git2r::commit(repo, paste0('Seasonality-',"from-",input$Date[1],
+                             "-to-",input$Date[2], '.csv added'))
+  # actualizamos el repositorio remoto
+  git2r::push(repo, credentials = github_credentials)
+  
+  # hay que evitar usar las user pass pero no lo he conseguido así todavía:
+  # git2r::push(repo, credentials = git2r::cred_ssh_key())
+  # git2r::libgit2_features() ??
+})
+```
+
+```{r descargaTiempos}
+output$downTimes <- shiny::downloadHandler(
+  filename = function() {
+    paste0(input$downTimes, "times.txt")
+  },
+  content = function(file) {
+    writeLines(tiempos, file)
+  }
+)
+```
+
+
+
+# Ránking {data-icon="fa-chart-line"}
+
+```{r opciones}
+opciones <- c(
+  "1. Frequency of products with coded label",
+  "2. Uncoded Product Frequency",
+  "3. Product groupings on the same trip",
+  "4. Groups of products in the same trip with number of pallets"
+)
+shiny::selectInput(inputId = 'Selector', label = 'Ranking:', choices = opciones)
+
+# shiny::sidebarPanel(shiny::selectInput(inputId = 'Selector',
+#                                        label = 'Ranking:',
+#                                        choices = opciones),
+#                     width = 10)
+
+# shiny::uiOutput("select")
+```
+
+```{r ranking}
+ranking <- list()
+
+ranking[[1]] <- cuenta("cod") # cuenta_codigos
+
+ranking[[2]] <- cuenta("mercancia") # cuenta_mercancias
+
+# cuenta misma matrícula y mismo viaje y junta sus productos
+# https://stackoverflow.com/questions/20775040/elasticsearch-group-by-multiple-fields
+ranking[[3]] <- cuenta( # productos_viajes
+  c("fechacargadesde", "matriculaentrega", "cod"), c(F,F,T))
+
+ranking[[4]] <- agrupa_agrega( # productos_viajes_palets
+  c("fechacargadesde", "matriculaentrega", "cod"), c(F,F,T), sum_palets)
+```
+
+```{r aggDataN}
+aggDataN <- shiny::reactive({
+  {actualizarFechas()}
+  start_time <- proc.time()
+  
+  opcion <- which(input$Selector == opciones)
+  df <- datos %search% ({filtra_fechapedido()} + ranking[[opcion]])
+  
+  if (opcion %in% 3:4) {
+    df %<>%
+      dplyr::rename(Fecha = key_as_string,
+                    GB_Matricula = group_by_matriculaentrega.buckets) %>%
+      dplyr::select(c(Fecha, GB_Matricula)) %>%
+      tidyr::unnest(GB_Matricula) %>%
+      dplyr::rename(Matricula = key) %>%
+      dplyr::mutate(GB_COD = group_by_cod$buckets) %>%
+      dplyr::select(c(Matricula, Fecha, GB_COD)) %>%
+      tidyr::unnest(GB_COD) %>%
+      dplyr::rename(COD = key)
+    
+    if (opcion == 3) {
+      df %<>% dplyr::rename(Producto = COD)
+    } else { # opcion == 4
+      df %<>% dplyr::mutate(Producto = paste0(sum_palets$value,"-",COD),
+                            .keep = "unused")
+    }
+    
+    df %<>% dplyr::group_by(Matricula, Fecha) %>%
+      dplyr::summarise(Carga = paste0(Producto, collapse = ", "),
+                       .groups = "drop") %>%
+      dplyr::count(Carga, sort = T)
+  }
+  
+  colnames(df) <- c("Product","Frequency")
+
+  end_time <- proc.time()
+  tiempos <<- paste0(tiempos, "aggDataN: ", opcion, ": ",
+                     paste0(format((end_time-start_time)[1:3], digits = 3),
+                            collapse = " - "),
+                     "\n")
+  
+  return(df)
+})
+
+output$tablaN <- DT::renderDataTable(DT::datatable(
+  {aggDataN()}, rownames = F,
+  options = list(scrollX = TRUE, sScrollY = '75vh', scrollCollapse = TRUE),
+  extensions = list("Scroller")))
+```
+
+```{r}
+shinycssloaders::withSpinner(DT::dataTableOutput(outputId = "tablaN"))
+```
+
+
+
+# Trip duration {data-icon="fa-chart-line"}
+
+## Ránking 2
+
+```{r filtra_matr_vacias}
+# https://stackoverflow.com/questions/25561981/find-documents-with-empty-string-value-on-elasticsearch
+regla_matr_vacia <- regla_term("matriculaentrega", "")
+
+filtra_matr_vacias <- shiny::reactive({
+  # 2 clausulas que se deben cumplir
+  filtro_comp(c({regla_fechacarga()}, regla_matr_vacia))
+})
+```
+
+```{r filtra_matr_validas}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/regexp-syntax.html
+patron <- paste0('([A-Z]{1,2}-?[0-9]{2,6}(-?[A-Z]{1,3})?)|',
+                 '([0-9]SU[0-9]{4})|',
+                 '(EW[A-Z][0-9]([A-Z]|[0-9])[A-Z]([A-Z]|[0-9]))|',
+                 '(W[0-9]{4}[A-Z]{2})|',
+                 '([A-Z]{2}[0-9]{4}[A-Z])|',
+                 '([A-Z]{3}[0-9]{4}[A-Z])|',
+                 '(WS[A-Z]-?([A-Z]|[0-9]){2}-?([A-Z]|[0-9]){2})|',
+                 '([A-Z]{3,4}-?[0-9]{2,3}-?[A-Z]?)|',
+                 '([A-Z]{3}-?[0-9]{5})|',
+                 '([A-Z]{3,4}-?[0-9]{3,4})|',
+                 '([A-Z]{2}-?[A-Z]{2}-?[0-9]{4})|',
+                 '([0-9]{4}-?[A-Z]{3})|',
+                 '([0-9]{2}-?(([A-Z]{2}-?[0-9]{2})|([0-9]{2}-?[A-Z]{2})))')
+regla_matr_valida <- regla_regexp("matriculaentrega", patron)
+
+filtra_matr_validas <- shiny::reactive({
+  # 2 clausulas que se deben cumplir
+  filtro_comp(c({regla_fechacarga()}, regla_matr_valida))
+})
+```
+
+```{r filtra_matr_invalidas}
+filtra_matr_invalidas <- shiny::reactive({
+  # una clausula se debe cumplir y dos no
+  filtro_comp({regla_fechacarga()},
+              c(regla_matr_vacia,regla_matr_valida))
+})
+```
+
+```{r filtra_matr_selec}
+regla_matr_selec <- shiny::reactive({
+  shiny::req(input$selectMatr)
+  if (input$selectMatr != "All")
+    return(regla_term("matriculaentrega", input$selectMatr))
+  return(regla_matr_valida)
+})
+
+filtra_matr_selec <- shiny::reactive({
+  filtro_comp(c({regla_fechacarga()}, {regla_matr_selec()}))
+})
+```
+
+```{r cuenta_matricula}
+cuenta_matricula <- cuenta("matriculaentrega", T)
+```
+```{r cuenta_fechacarga}
+cuenta_fechacarga <- cuenta(c("fechacargadesde"))
+```
+```{r cuenta_matr_por_fechacarga}
+cuenta_matr_por_fechacarga <- cuenta(c("fechacargadesde", "matriculaentrega"))
+```
+```{r calcula_viajes}
+calcula_viajes <- agrupa_agrega(c("fechacargadesde","matriculaentrega"),
+                                T,max_fechaentrega)
+```
+
+```{r listaMatriculas}
+# Jose 10/06/2020 (start)
+listaMatriculas <- shiny::reactive({
+  {actualizarFechas()}
+  start_time <- proc.time()
+  
+  validas <- datos_na %search% ({filtra_matr_validas()} + cuenta_matricula)
+  validas %<>% dplyr::pull(key)
+    
+  end_time <- proc.time()
+  tiempos <<- paste0(tiempos, "listaMatriculas: ", length(validas), ": ",
+                     paste0(format((end_time-start_time)[1:3], digits = 3),
+                            collapse = " - "),
+                     "\n")
+  
+  return(validas)
+})
+
+output$selectMatr <- shiny::renderUI({shiny::selectInput(
+  inputId = "selectMatr", label = "Trip selection",
+  choices = append("All", {listaMatriculas()}), 
+  selected = 0, multiple = FALSE)
+})
+```
+
+```{r duracionViajes}
+infoLog <<- NULL
+
+duracionViajes <- shiny::reactive({
+  shiny::req(input$selectMatr)
+  start_time <- proc.time()
+  
+  if (input$selectMatr == "All") {
+    matriculas <- {listaMatriculas()}
+    
+    invalidas <- tryCatch(
+      {
+        res <- data.table::setDT(
+          datos_na %search% ({filtra_matr_invalidas()} + cuenta_matr_por_fechacarga)
+        )
+        res %>%
+          dplyr::filter(doc_count > 0) %>%
+          dplyr::rename(FechaCarga = key_as_string,
+                        MInvalidas = group_by_matriculaentrega.buckets) %>%
+          dplyr::select(FechaCarga, MInvalidas) %>%
+          dplyr::mutate(MInvalidas = lapply(MInvalidas, dplyr::pull, key))
+      },
+      error = function(cond) {
+        data.table::data.table(FechaCarga = character(),
+                               MInvalidas = list())
+      }
+    )
+    
+    vacias <- tryCatch(
+      {
+        res <- data.table::setDT(
+          datos_na %search% ({filtra_matr_vacias()} + cuenta_fechacarga)
+        )
+        res %>%
+          dplyr::filter(doc_count > 0) %>%
+          dplyr::rename(FechaCarga = key_as_string,
+                        MVacias = doc_count) %>%
+          dplyr::select(FechaCarga, MVacias)
+      },
+      error = function(cond) {
+        data.table::data.table(FechaCarga = character(),
+                               MVacias = integer())
+      }
+    )
+    
+  } else {
+    matriculas <- input$selectMatr
+    invalidas <- data.table::data.table(FechaCarga = character(),
+                                        MInvalidas = list())
+    vacias    <- data.table::data.table(FechaCarga = character(),
+                                        MVacias = integer())
+  }
+  
+  infoViajes <- data.table::setDT(
+    datos_na %search% ({filtra_matr_selec()} + calcula_viajes)
+  )
+  infoViajes %<>%
+    dplyr::filter(doc_count > 0) %>%
+    dplyr::rename(FechaCarga = key_as_string,
+                  GB_Matricula = group_by_matriculaentrega.buckets) %>%
+    dplyr::select(FechaCarga, GB_Matricula) %>%
+    tidyr::unnest(GB_Matricula) %>%
+    dplyr::rename(Matricula = key) %>%
+    dplyr::mutate(FechaEntrega = max_fechaentregadesde$value_as_string,
+                  .keep = "unused") %>%
+    dplyr::select(Matricula, FechaCarga, FechaEntrega) %>%
+    dplyr::mutate(Duracion = as.numeric(difftime(FechaEntrega,
+                                                 FechaCarga,
+                                                 units = 'hour')))
+  
+  durNeg <- infoViajes %>% dplyr::filter(Duracion < 0) %>%
+    dplyr::group_by(FechaCarga) %>%
+    dplyr::summarise(MDurNeg = list(unique(Matricula)))
+  
+  infoViajes %<>% dplyr::filter(Duracion >= 0) %>%
+    dplyr::select(!FechaEntrega)
+  names(infoViajes) <- c("License plate", "Date", "Duration (hours)")
+  
+  infoLog <<- purrr::reduce(list(vacias,invalidas,durNeg), merge, all = T)
+  infoLog$MVacias[is.na(infoLog$MVacias)] <<- 0
+  infoLog[is.na(infoLog)] <<- NULL
+  infoLog <<- infoLog %>%
+    dplyr::mutate(errores = MVacias + vapply(MDurNeg,length,numeric(1)),
+                  warnings = vapply(MInvalidas,length,numeric(1)))
+  
+  totalErr <- sum(infoLog$errores)
+  totalWarnings <- sum(infoLog$warnings)
+  
+  if (totalErr > 0 & totalWarnings > 0)
+    generados <- paste0(totalErr, " errors and ", totalWarnings, " warnings")
+  else if (totalErr > 0) 
+    generados <- paste0(totalErr, " errors")
+  else if (totalWarnings > 0) 
+    generados <- paste0(totalWarnings, " warnings")
+  
+  if (totalErr + totalWarnings > 0) {
+    mensaje <- paste0("In data cleaning there were ", generados, ".",
+                      " To see them, download file log.txt.")
+    shiny::showNotification(mensaje, type = "warning")
+  }
+  
+  end_time <- proc.time()
+  tiempos <<- paste0(tiempos, "duracionViajes: ", input$selectMatr, ": ",
+                     paste0(format((end_time-start_time)[1:3], digits = 3),
+                            collapse = " - "),
+                     "\n")
+  
+  return(infoViajes)
+})
+
+output$tablaDuraciones <- shiny::renderTable(
+  {duracionViajes()}, bordered = TRUE, spacing = 'm', align = 'c')
+```
+
+```{r descargaLog}
+output$downLog <- shiny::downloadHandler(
+  filename = function() {
+    paste0(input$downLog, "log.txt")
+  },
+  content = function(file) {
+    logInfo <- infoLog %>% dplyr::arrange(FechaCarga)
+    if (!plyr::empty(logInfo)) {
+      logInfo %<>% dplyr::transmute(
+        Fecha = paste0("~~~~~~~~~~~~~~~~~\n",
+                       "File ", FechaCarga,
+                       "\n~~~~~~~~~~~~~~~~~\n"),
+        
+        Vacias = dplyr::if_else(MVacias == 0, "",
+                    paste0("Error: ",MVacias," empty license plate(s).\n")),
+        
+        Invalidas = dplyr::if_else(sapply(MInvalidas,length) == 0, "",
+                    paste0("Warning: ",sapply(MInvalidas,length),
+                           " wrong license plate(s): ",
+                           sapply(MInvalidas, paste0, collapse = ", "), "\n")),
+        
+        DurNeg = dplyr::if_else(sapply(MDurNeg,length) == 0, "",
+                    paste0("Error: ",sapply(MDurNeg,length),
+                           " negative travel duration(s): ",
+                           "fechaCarga < fechaEntrega for license plate(s): ",
+                           sapply(MDurNeg, paste0, collapse = ", "), "\n")),
+        
+        Total = paste0("Total: ",errores+warnings," trip(s) ruled out.\n")
+      )
+      logInfo %<>% apply(MARGIN = 1, paste0, collapse = "")
+      logInfo %<>% paste0(collapse = "")
+    
+      writeLines(logInfo, file)
+    } else {
+      mensaje <- "log.txt file was not downloaded because it is empty"
+      shiny::showNotification(mensaje, type = "error")
+    }
+  }
+)
+```
+
+```{r estadDuraciones}
+aggDuraciones <- shiny::reactive({
+  # shiny::req(input$selectMatr)
+  rto <- {duracionViajes()}
+  if (input$selectMatr == "All" & !is.null(rto)) {
+    names(rto) <- c("Plate", "Date", "Duration")
+    rto$Duration %<>% as.numeric()
+    rto %>% dplyr::summarise(
+      Mean               = mean(Duration),
+      Median             = median(Duration),
+      `Standard Deviation` = sd(Duration),
+      `Minumum`            = min(Duration),
+      `Maximum`            = max(Duration)
+    )
+  }
+})
+
+output$estadDuraciones <- shiny::renderTable(
+  {aggDuraciones()}, bordered = TRUE, spacing = 'm', align = 'c', digits = 2)
+```
+
+```{r grafDuraciones}
+plotDuraciones <- shiny::reactive({
+  # shiny::req(input$selectMatr)
+  rto <- {duracionViajes()}
+  if (input$selectMatr == "All" & !is.null(rto)) {
+    names(rto) <- c("Plate", "Date", "Duration") 
+    rto$Duration %<>% as.numeric()
+    fechas <- rto %>% dplyr::pull(Date) %>% unique()
+    
+    n <- length(fechas)
+    if (n > 20){
+      gap <- n/19
+      index <- unique(c(1, as.integer(seq(gap, n, gap)), n))
+      rto %<>% dplyr::filter(Date %in% fechas[index])
+      rto$Date %<>% factor()
+    }
+    
+    ggplot2::ggplot(rto, ggplot2::aes(Date, Duration, fill = Date)) +
+      ggplot2::geom_boxplot() + ggplot2::theme(legend.position = "none")
+  }
+})
+
+output$grafDuraciones <- shiny::renderPlot(
+  {plotDuraciones()}, bg = "transparent")
+```
+
+```{r}
+shiny::uiOutput(outputId = "selectMatr")
+shiny::splitLayout(
+  cellWidths = c("400", "600"),
+  htmltools::div(
+    style = 'height:450px; width:370px; overflow-y: scroll;',
+    shinycssloaders::withSpinner(shiny::tableOutput(outputId="tablaDuraciones"))
+  ),
+  shinycssloaders::withSpinner(shiny::tableOutput(outputId='estadDuraciones'))
+)
+htmltools::div(style = 'height:100px;', NULL)
+htmltools::div(
+  style = 'height:300px; width:950px;',
+  shinycssloaders::withSpinner(shiny::plotOutput(outputId="grafDuraciones"))
+)
+
+# Jose 10/06/2020 (end)
+
+#shinycssloaders::withSpinner(shiny::plotOutput(outputId = "grafDuraciones"))
+```
+
+
+
+# Seasonality
+
+```{r info_exp}
+# info_exp <- cuenta(c("cod", "fechacargadesde"), T)
+info_exp <- cuenta(c("fechacargadesde", "cod"), T)
+```
+
+```{r exportacionesEstac}
+exportacionesEstac <- shiny::reactive({
+  {actualizarFechas()}
+  start_time <- proc.time()
+  
+  casi <- datos %search% ({filtra_fechapedido()} + info_exp)
+  casi %<>%
+    # dplyr::rename(Product = key, # COD
+    #               GB_Date = group_by_fechacargadesde.buckets) %>%
+    # dplyr::select(c(Product, GB_Date)) %>%
+    # tidyr::unnest(GB_Date) %>%
+    # dplyr::rename(Date = key_as_string, # FechaCargaDesde
+    #               Frequency = doc_count) %>%
+    # dplyr::select(c(Product, Date, Frequency))
+    dplyr::rename(Date = key_as_string, # FechaCargaDesde
+                  GB_COD = group_by_cod.buckets) %>%
+    dplyr::select(c(Date, GB_COD)) %>%
+    tidyr::unnest(GB_COD) %>%
+    dplyr::rename(Product = key, # COD
+                  Frequency = doc_count) %>%
+    dplyr::select(c(Product, Date, Frequency))
+  # casi %<>% dplyr::filter(complete.cases(.))
+  # HAY QUE MIRAR POR QUÉ ALGUNAS FECHAS DAN NA Y VER SI HAY QUE DECIRLO EN EL LOG!
+  
+  end_time <- proc.time()
+  tiempos <<- paste0(tiempos, "exportacionesEstac: ",
+                     paste0(format((end_time-start_time)[1:3], digits = 3),
+                            collapse = " - "),
+                     "\n")
+  
+  return(casi)
+})
+```
+
+```{r descargaExp}
+descargaExp <-  shiny::reactive({
+  shiny::req(input$selectProd)
+  
+  data2 <- {exportacionesEstac()}
+  if (!("All" %in% input$selectProd))
+    data2 %<>% dplyr::filter(Product %in% input$selectProd)
+  
+  data_wide <- tidyr::spread(data2, Date, Frequency)
+  data_wide[is.na(data_wide)] <- 0
+  return(data_wide)
+})
+
+output$downExp <- shiny::downloadHandler(
+  filename = function() {
+    paste0('Seasonality-',"from-",input$Date[1],"-to-",input$Date[2], '.csv')
+  },
+  content = function(con) {
+    write.csv({descargaExp()}, con)
+  }
+)
+```
+
+```{r selectProd}
+output$selectProd <- shiny::renderUI({ shiny::selectInput(
+  inputId = "selectProd", label = "Select the product",
+  # choices =  as.character(unique(exportacionesEstac()$Product)),
+  choices = append("All", as.character(unique(exportacionesEstac()$Product))),
+  selected = "All", multiple = TRUE)
+})
+```
+
+```{r grafExp}
+plotExp <- shiny::reactive({
+  shiny::req(input$selectProd)
+  
+  data2 <- {exportacionesEstac()}
+  if (!("All" %in% input$selectProd))
+    data2 %<>% dplyr::filter(Product %in% input$selectProd)
+  
+  gg <- ggplot2::ggplot(data2, ggplot2::aes(Date, Frequency,
+                                            group = Product,
+                                            color = Product)) +
+    ggplot2::geom_line() + ggplot2::geom_point()
+  
+  # if (!("All" %in% input$selectProd))
+    gg <- gg +
+      ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90,
+                                                         vjust = 0.5,
+                                                         hjust = 1))
+  return(gg)
+})
+
+output$grafExp <- shiny::renderPlot({plotExp()})
+```
+
+## Trocito 1
+
+```{r}
+shiny::uiOutput(outputId = "selectProd")  
+```
+
+## Trocito 2
+
+```{r}
+shiny::plotOutput(outputId = "grafExp")
+```
+
+
+
+# Geographical Representation
+
+```{r country_info}
+longitud <- c( 5.291266 ,-0.1257400, 2.0000000,-3.70256  , 9,
+               12.8333000,-8.0000000, 8.0000000, 4.0000000,13.3333000,
+               15.5000000,20.0000000,20.0000000,15.5000000, 5.7500000,
+               10.0000000,19.5000000,15.0000000,24.0000000,22.0000000)
+latitud <- c(52.132633 ,51.5085300,46.0000000,40.4165   ,51,
+             42.8333000,39.5000000,47.0000000,50.8333000,47.3333000,
+             45.1667000,47.0000000,52.0000000,49.7500000,52.5000000,
+             56.0000000,48.6667000,62.0000000,56.0000000,39.0000000)
+pais <- c("HOLANDA"  ,"INGLATERRA","FRANCIA","ESPAÑA"         ,"ALEMANIA"    ,
+          "ITALIA"   ,"PORTUGAL"  ,"SUIZA"  ,"BELGICA"        ,"AUSTRIA"     ,
+          "CROACIA"  ,"HUNGRIA"   ,"POLONIA","REPUBLICA CHECA","PAISES BAJOS",
+          "DINAMARCA","ESLOVAQUIA","SUECIA" ,"LITUANIA"       ,"GRECIA")
+# FALTAN SERBIA Y RUMANIA (Y PUEDE QUE MAS)
+country_info <- data.frame(pais,longitud,latitud)
+```
+
+```{r geo_info}
+geo_info <- agrupa_agrega(c("paiscarga", "paisdescarga"), F, sum_palets)
+```
+
+```{r geo_data}
+geo_data <- shiny::reactive({ 
+  {actualizarFechas()}
+  start_time <- proc.time()
+  
+  summa <- datos %search% ({filtra_fechapedido()} + geo_info)
+  summa %<>%
+    dplyr::rename(PaisCarga = key,
+                  GB_PaisDescarga = group_by_paisdescarga.buckets) %>%
+    dplyr::select(c(PaisCarga, GB_PaisDescarga)) %>%
+    tidyr::unnest(GB_PaisDescarga) %>%
+    dplyr::rename(PaisDescarga = key) %>%
+    dplyr::mutate(intensity = sum_palets$value) %>%
+    dplyr::select(c(PaisCarga, PaisDescarga, intensity)) %>%
+  
+    merge(country_info, by.x = "PaisCarga", by.y = "pais") %>%
+    dplyr::rename(lon_origen = longitud, lat_origen = latitud) %>%
+    merge(country_info, by.x = "PaisDescarga", by.y = "pais") %>%
+    dplyr::rename(lon_destino = longitud, lat_destino = latitud)
+  
+  end_time <- proc.time()
+  tiempos <<- paste0(tiempos, "geo_data: ",
+                     paste0(format((end_time-start_time)[1:3], digits = 3),
+                            collapse = " - "),
+                     "\n")
+  
+  return(summa)
+})
+```
+
+```{r mapa}
+output$map <- leaflet::renderLeaflet({
+  dataM2 <- {geo_data()}
+  
+  mapa <- leaflet::leaflet() %>%
+    leaflet::setView(lng = 10.4105300, lat = 52.5243700, zoom = 4) %>% 
+    leaflet::addTiles()  %>%
+    leaflet::addCircleMarkers(lng = longitud, lat = latitud,
+                              weight = 1, radius = 10, opacity = 1)   
+  
+  colfunc <- colorRampPalette(
+    c("purple","blue","steelblue","green","yellow","orange","red"))
+  
+  maxint <- max(dataM2$intensity)
+  
+  for (i in 1:nrow(dataM2)){
+    f <- dataM2 %>% dplyr::slice(i)
+    mapa %<>% leaflet.extras::addGeodesicPolylines(
+      lat=c(f$lat_origen, f$lat_destino),
+      lng=c(f$lon_origen, f$lon_destino),
+      opacity = 0.7,
+      weight = 2 + 5*f$intensity/maxint,
+      color = colfunc(as.integer(maxint))[f$intensity],
+      label = f$intensity)
+  }
+  
+  # mapa %<>% leaflet::addCircleMarkers(lng = city_info$lon, lat = city_info$lat,
+  #                                     weight = 1, radius = 10, opacity = 1)
+  
+  return(mapa)
+})
+```
+
+```{r}
+leaflet::leafletOutput(outputId = "map")
+```
+
+
+
+# Help
+
+```{r}
+# shiny::sidebarLayout(
+# shiny::sidebarPanel()
+shiny::mainPanel(
+  htmltools::p("This window contains information about the meaning of the different selections available in the ranking window:"),
+  htmltools::p("1. Frequency of products with coded label: It is based on the grouping of products with the same code, the calculation of the frequency of each of them and a ranking."),
+  htmltools::p("2. Uncoded Product Frequency: It is based on the calculation of frequencies and a ranking of the products with their full name, without having grouped those with the same code."),
+  htmltools::p("3. Product groupings on the same trip: frequency and ranking of the most frequent product groups."),
+  htmltools::p("4. Groups of products in the same trip with number of pallets: frequency and ranking of the most frequent product groups with the number of pallets of each (number preceding the product)."))
+
+# doc <- tags$html(
+#   tags$head(
+#     tags$title('My first page')
+#   ),
+#   tags$body(
+#     h1('My first heading'),
+#     p('My first paragraph, with some ',
+#       strong('bold'),
+#       ' text.'),
+#     div(id='myDiv', class='simpleDiv',
+#         'Here is a div with some attributes.'),
+#     p("A new p() command starts a new paragraph. Supply a style attribute to change the format of the entire paragraph.",
+#       style = "font-family: 'times'; font-si16pt"),
+#     strong("strong() makes bold text."),
+#     em("em() creates italicized (i.e, emphasized) text."),
+#     br(),
+#     code("code displays your text similar to computer code"),
+#     div("div creates segments of text with a similar style. This division of text is all blue because I passed the argument 'style = color:blue' to div",
+#         style = "color:blue"),
+#     br(),
+#     p("span does the same thing as div, but it works with",
+#       span("groups of words", style = "color:blue"),
+#       "that appear inside a paragraph.")
+#   )
+# )
+```
+
+
+
+# Contact
+<!--
+Informe realizado por [Ferran VB](https://enrdados.netlify.com/), usado [R]()
+-->
